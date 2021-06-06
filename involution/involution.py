@@ -5,6 +5,7 @@ from string import Template
 import torch
 from torch.nn.modules.utils import _pair
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.cuda import HalfTensor, FloatTensor, DoubleTensor
 
 import cupy
@@ -136,7 +137,7 @@ def _load_kernel(kernel_name: str, code: str, **kwargs):
 
 
 def _get_blocks(n: int) -> int:
-    return (n + CUDA_NUM_THREADS - 1) // CUDA_NUM_THREADS
+    return (n - 1) // CUDA_NUM_THREADS + 1
 
 
 class _involution2d(torch.autograd.Function):
@@ -237,12 +238,14 @@ def _involution2d_cuda(
     assert input.shape[-2] // stride[0] == weight.shape[-2]
     assert input.shape[-1] // stride[1] == weight.shape[-1]
     if input.is_cuda:
-        out: torch.Tensor = _involution2d.apply(input, weight, stride, padding, dilation)
+        out: torch.Tensor = _involution2d.apply(
+            input, weight, stride, padding, dilation)
         if bias is not None:
             out += bias.view(1, -1, 1, 1)
     else:
         raise NotImplementedError
     return out
+
 
 class Involution2d(nn.Module):
     def __init__(self,
@@ -257,6 +260,20 @@ class Involution2d(nn.Module):
                  sigma_mapping: Optional[nn.Module] = None,
                  reduce_ratio: int = 1,
                  ) -> None:
+        """2D Involution: https://arxiv.org/pdf/2103.06255.pdf
+
+        Args:
+            in_channels (int): Number of input channels
+            out_channels (int): Number of output channels
+            kernel_size (Union[int, Tuple[int, int]], optional): Kernel size to be used. Defaults to 7.
+            stride (Union[int, Tuple[int, int]], optional): Stride factor to be utilized. Defaults to 1.
+            padding (Union[int, Tuple[int, int]], optional): Padding to be used in unfold operation. Defaults to 3.
+            dilation (Union[int, Tuple[int, int]], optional): Dilation in unfold to be employed. Defaults to 1.
+            groups (int, optional): Number of groups to be employed. Defaults to 1.
+            bias (bool, optional): If true bias is utilized in each convolution layer. Defaults to False.
+            sigma_mapping (Optional[nn.Module], optional): Non-linear mapping as introduced in the paper. If none BN + ReLU is utilized
+            reduce_ratio (int, optional): Reduce ration of involution channels. Defaults to 1.
+        """
         super(Involution2d, self).__init__()
         assert isinstance(in_channels, int) and in_channels > 0, \
             '"in_channels" must be a positive integer.'
@@ -291,7 +308,8 @@ class Involution2d(nn.Module):
         self.reduce_ratio: int = reduce_ratio
 
         self.sigma_mapping = sigma_mapping if isinstance(sigma_mapping, nn.Module) else nn.Sequential(
-            nn.BatchNorm2d(num_features=self.out_channels // self.reduce_ratio, momentum=0.3),
+            nn.BatchNorm2d(num_features=self.out_channels //
+                           self.reduce_ratio, momentum=0.3),
             nn.ReLU()
         )
         self.initial_mapping = nn.Conv2d(in_channels=self.in_channels, out_channels=self.out_channels, kernel_size=1, bias=bias) \
@@ -302,13 +320,53 @@ class Involution2d(nn.Module):
             in_channels=self.in_channels, out_channels=self.out_channels // self.reduce_ratio, kernel_size=1, bias=bias)
         self.span_mapping = nn.Conv2d(in_channels=self.out_channels // self.reduce_ratio,
                                       out_channels=self.kernel_size[0] * self.kernel_size[1] * self.groups, kernel_size=1, bias=bias)
+    
+    def __repr__(self) -> str:
+        """Method returns information about the module
+
+        Returns:
+            str: Info string
+        """
+        return (f'{self.__class__.__name__}({self.in_channels}, {self.out_channels}, kernel_size=({self.kernel_size[0]}, {self.kernel_size[1]}), '
+            f'stride=({self.stride[0]}, {self.stride[1]}), padding=({self.padding[0]}, {self.padding[1]}), dilation=({self.dilation[0], self.dilation[1]}), '
+            f'groups={self.groups}, bias={self.bias}, reduce_ratio={self.reduce_ratio}, sigma_mapping={str(self.sigma_mapping)}'
+        )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Forward pass
+
+        Args:
+            input (torch.Tensor): Input tensor of the shape [batch size, in channels, height, width]
+
+        Returns:
+            torch.Tensor: Output tensor of the shape [batch size, out channels, height, width] (w/ same padding)
+        """
         assert input.ndim == 4, f'Input tensor to Involution2d must be 4d but {input.ndim}d tensor is given.'
 
         kernel: torch.Tensor = self.span_mapping(
             self.sigma_mapping(self.reduce_mapping(self.o_mapping(input))))
         batch_size, _, height, width = kernel.shape
-        kernel: torch.Tensor = kernel.view(
-            batch_size, self.groups, self.kernel_size[0], self.kernel_size[1], height, width)
-        return _involution2d_cuda(self.initial_mapping(input), kernel, stride=self.stride, padding=self.padding, dilation=self.dilation)
+
+        input_init: torch.Tensor = self.initial_mapping(input)
+
+        if input.is_cuda:
+            kernel: torch.Tensor = kernel.view(
+                batch_size, self.groups, self.kernel_size[0], self.kernel_size[1], height, width)
+            return _involution2d_cuda(input_init, kernel, stride=self.stride, padding=self.padding, dilation=self.dilation)
+        else:
+            in_height, in_width = input.shape[-2:]
+            out_height = (in_height + 2 * self.padding[0] - self.dilation[0] * (
+                self.kernel_size[0] - 1) - 1) // self.stride[0] + 1
+            out_width = (in_width + 2 * self.padding[1] - self.dilation[1] * (
+                self.kernel_size[1] - 1) - 1) // self.stride[1] + 1
+
+            input_unfolded: torch.Tensor = F.unfold(
+                input_init, self.kernel_size, self.dilation, self.padding, self.stride)
+            input_unfolded = input_unfolded.view(batch_size, self.groups, self.out_channels //
+                                                 self.groups, self.kernel_size[0] * self.kernel_size[1], out_height, out_width)
+
+            kernel = kernel.view(
+                batch_size, self.groups, self.kernel_size[0] * self.kernel_size[1], kernel.shape[-2], kernel.shape[-1]).unsqueeze(dim=2)
+
+            output: torch.Tensor = (kernel * input_unfolded).sum(dim=3)
+            return output.view(batch_size, -1, output.shape[-2], output.shape[-1])

@@ -78,7 +78,7 @@ __global__ void involution2d_backward_grad_input_kernel(
           const int w_out = w_out_s / ${stride_width};
           if ((h_out >= 0) && (h_out < ${top_height}) && (w_out >= 0) && (w_out < ${top_width})) {
             const int offset = ((n * ${channels} + c) * ${top_height} + h_out) * ${top_width} + w_out;
-            const int offset_weight = ((((n * ${groups} + g) * ${kernel_height} + kh) * ${kernel_width} + kw) * ${top_height} + h_out) 
+            const int offset_weight = ((((n * ${groups} + g) * ${kernel_height} + kh) * ${kernel_width} + kw) * ${top_height} + h_out)
                   * ${top_width} + w_out;
             value += weight_data[offset_weight] * top_diff[offset];
           }
@@ -161,11 +161,10 @@ class _involution2d(torch.autograd.Function):
 
         with torch.cuda.device_of(input):
             kernel = _load_kernel('involution2d_forward_kernel', _involution2d_kernel, dtype=_dtype(input), nthreads=num_elements,
-                                  batch_size=batch_size, channels=channels, groups=weight.shape[
-                                      1], bottom_height=height, bottom_width=width,
-                                  top_height=out_height, top_width=out_width, kernel_height=kernel_height, kernel_width=kernel_width,
-                                  stride_height=stride[0], stride_width=stride[
-                                      1], dilation_height=dilation[0], dilation_width=dilation[1],
+                                  batch_size=int(batch_size), channels=int(channels), groups=int(weight.shape[1]),
+                                  bottom_height=int(height), bottom_width=int(width), top_height=int(out_height), top_width=int(out_width),
+                                  kernel_height=int(kernel_height), kernel_width=int(kernel_width),
+                                  stride_height=stride[0], stride_width=stride[1], dilation_height=dilation[0], dilation_width=dilation[1],
                                   pad_height=padding[0], pad_width=padding[1])
             kernel(block=(CUDA_NUM_THREADS, 1, 1),
                    grid=(_get_blocks(num_elements), 1, 1),
@@ -189,10 +188,9 @@ class _involution2d(torch.autograd.Function):
 
         grad_input, grad_weight = None, None
 
-        opt = dict(dtype=_dtype(grad_output), batch_size=batch_size, channels=channels, groups=weight.shape[1],
-                   bottom_height=height, bottom_width=width, top_height=out_height, top_width=out_width,
-                   kernel_height=kernel_height, kernel_width=kernel_width, stride_height=stride[
-                       0], stride_width=stride[1],
+        opt = dict(dtype=_dtype(grad_output), batch_size=int(batch_size), channels=int(channels), groups=int(weight.shape[1]),
+                   bottom_height=int(height), bottom_width=int(width), top_height=int(out_height), top_width=int(out_width),
+                   kernel_height=int(kernel_height), kernel_width=int(kernel_width), stride_height=stride[0], stride_width=stride[1],
                    dilation_height=dilation[0], dilation_width=dilation[1], pad_height=padding[0], pad_width=padding[1])
 
         with torch.cuda.device_of(input):
@@ -320,7 +318,7 @@ class Involution2d(nn.Module):
             in_channels=self.in_channels, out_channels=self.out_channels // self.reduce_ratio, kernel_size=1, bias=bias)
         self.span_mapping = nn.Conv2d(in_channels=self.out_channels // self.reduce_ratio,
                                       out_channels=self.kernel_size[0] * self.kernel_size[1] * self.groups, kernel_size=1, bias=bias)
-    
+
     def __repr__(self) -> str:
         """Method returns information about the module
 

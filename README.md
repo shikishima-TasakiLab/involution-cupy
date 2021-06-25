@@ -7,5 +7,5 @@ This repository contains a 2D Involution, a fusion of [the official efficient im
 ## Installation
 
 ```bash
-pip install git+https://github.com/shikishima-TasakiLab/involution
+pip install git+https://github.com/shikishima-TasakiLab/involution-cupy
 ```
